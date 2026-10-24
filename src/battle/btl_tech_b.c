@@ -1,5 +1,13 @@
 #include "common.h"
 #include "battle/btl_tech_b.h"
+#include "battle/btl_mod.h"
+
+/* The mod menu's percent of a value (a ki cost, the damage taken); 100 changes nothing. */
+static s32 BtlTechB_ModPct(s32 profile, s32 what, s32 v) {
+    s32 pct = Port_ModPercent(profile, what);
+
+    return pct == 100 ? v : v * pct / 100;
+}
 
 /*
  * Character data accessors, 0x20F0E8..0x2129C8 (the continuation of btl_tech_a.c; see include/battle/btl_tech_b.h
@@ -122,7 +130,7 @@ f32 BtlParam_GetChargeRateB(BtlTechBChr *chr) {
 
 /* Parameter +0x7C: multiplier of the damage this character takes (BtlMember_Damage). */
 f32 BtlParam_GetDamageTakenScale(BtlTechBChr *chr) {
-    return BtlChar_GetObj(chr)->param->damageTaken;
+    return BtlChar_GetObj(chr)->param->damageTaken * ((f32)Port_ModPercent(BTL_MOD_PROFILE(chr), BTL_MODPCT_TAKEN) / 100.0f);
 }
 
 /* Seconds the fighter +0x99C gauge takes to fill: parameter +0x64, / 1.2 (ability 0x34), then x2 (0x1B) or / 0.8 (0x35). */
@@ -237,7 +245,7 @@ f32 BtlKiBlast_ScaleSpeedByAbility(BtlTechBChr *chr, s32 kind, f32 speed) {
         }
         break;
     }
-    return speed;
+    return speed * ((f32)Port_ModPercent(BTL_MOD_PROFILE(chr), BTL_MODPCT_BLASTSPEED) / 100.0f); /* (the mod menu: 100 changes nothing) */
 }
 
 /* Ki blast ki cost after abilities: doubled (0x2A), then halved (0x29). The kind argument is unused. */
@@ -248,7 +256,7 @@ s32 BtlKiBlast_ScaleKiByAbility(BtlTechBChr *chr, s32 ki, s32 kind) {
     if (BtlMember_HasAbility(chr, 0x29)) {
         ki /= 2;
     }
-    return ki;
+    return BtlTechB_ModPct(BTL_MOD_PROFILE(chr), BTL_MODPCT_BLASTCOST, ki);
 }
 
 /* With ability 0x4B and record type 0 or 1, the charged kinds give reaction 0x17 / 0x18 / 0x19 by charge level. */
@@ -944,7 +952,7 @@ s32 BtlMoveParam_GetKiCost(BtlTechBChr *chr, s32 n) {
         }
         break;
     }
-    return v;
+    return BtlTechB_ModPct(BTL_MOD_PROFILE(chr), BTL_MODPCT_MOVECOST, v);
 }
 
 /* Turn rate n in radians per frame (table +0x74 in degrees per second); x pose +0xAC for n 0. */
@@ -1130,6 +1138,17 @@ f32 BtlSuper_GetGuardPush(BtlTechBChr *chr, s32 slot) {
     return BtlChar_GetObj(chr)->super->guardPush[slot - 2] * 10.0f * BTL_KMH_PER_FRAME;
 }
 
+/* The mod menu's damage percent for the technique slot (2: attack 1, 3: attack 2, 4: ultimate); 100 changes nothing. */
+static s32 BtlSuper_ModDamage(BtlTechBChr *chr, s32 slot, s32 damage) {
+    s32 pct;
+
+    if (slot < 2 || slot > 4) {
+        return damage;
+    }
+    pct = Port_ModPercent(BTL_MOD_PROFILE(chr), slot == 2 ? BTL_MODPCT_SP1 : slot == 3 ? BTL_MODPCT_SP2 : BTL_MODPCT_ULT);
+    return pct == 100 ? damage : damage * pct / 100;
+}
+
 /* Table damage * curve row 9 (slots 2, 3) or row 10 (slot 4); per hit unless `total`. */
 s32 BtlSuper_GetBaseDamage(BtlTechBChr *chr, s32 slot, s32 total) {
     s32 damage = BtlChar_GetObj(chr)->super->damage[slot - 2];
@@ -1143,6 +1162,7 @@ s32 BtlSuper_GetBaseDamage(BtlTechBChr *chr, s32 slot, s32 total) {
         damage *= BtlStat_GetUltimateDamageScale(chr);
         break;
     }
+    damage = BtlSuper_ModDamage(chr, slot, damage);
     if (!total) {
         damage /= BtlSuper_GetHitCount(chr, slot);
     }
@@ -1162,6 +1182,7 @@ s32 BtlSuper_GetBaseGuardDamage(BtlTechBChr *chr, s32 slot, s32 total) {
         damage *= BtlStat_GetUltimateDamageScale(chr);
         break;
     }
+    damage = BtlSuper_ModDamage(chr, slot, damage);
     if (!total) {
         damage /= BtlSuper_GetHitCount(chr, slot);
     }
@@ -1171,11 +1192,16 @@ s32 BtlSuper_GetBaseGuardDamage(BtlTechBChr *chr, s32 slot, s32 total) {
 /* Ki the technique costs; halved with ability 0x2B. */
 s32 BtlSuper_GetKiCost(BtlTechBChr *chr, s32 slot) {
     s32 ki = BtlChar_GetObj(chr)->super->ki[slot - 2];
+    s32 prof;
 
     if (BtlMember_HasAbility(chr, 0x2B)) {
         ki /= 2;
     }
-    return ki;
+    prof = BTL_MOD_PROFILE(chr); /* (the mod menu: slots 2 / 3 are attacks 1 / 2, slot 4 the ultimate) */
+    if (Port_ModFlag(prof, slot == 4 ? BTL_MODFLAG_FREEULT : BTL_MODFLAG_FREESUPER)) {
+        return 0;
+    }
+    return BtlTechB_ModPct(prof, slot == 4 ? BTL_MODPCT_ULTCOST : BTL_MODPCT_SUPERCOST, ki);
 }
 
 /* Damage the technique does to its user. */

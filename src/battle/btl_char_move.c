@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_char_move.h"
+#include "battle/btl_mod.h"
 
 /* Fighter movement, 0x1DC9A0-0x1E0290 (see battle/btl_char_move.h for the model and the structures).
  *
@@ -1616,30 +1617,95 @@ void BtlMove_UpdateHoverOffset(BtlMoveChr *chr) {
     }
 }
 
-/* Per frame: the seven defence windows at chr+0x1068: each counts down to a floor and is re-opened by its input. */
+/* Easy-counter tuning (added). Windows are in frames; a window is open while its value is > 0.
+ *   BTL_WIN_EVADE_BONUS   extra frames for the evasion window at +0x1068 (the vanish / teleport dodge of the first hit;
+ *                         original 2 / 3 / 4 by health)
+ *   BTL_WIN_GUARD_BONUS   extra frames for the other windows a guard press opens: +0x106C (dodge without spending a
+ *                         dodge counter), +0x107C (rush break / evade), +0x1078 (throw break); original 2 (4) / 2 (4) / 5
+ *   BTL_WIN_COUNTER       frames for the Up + Rush counter window at +0x1070 (original 1: guard result 8)
+ *   BTL_WIN_SIDE_BONUS    extra frames for the guard + side window at +0x1074 (original 5)
+ *   BTL_WIN_ONLY_PLAYER   0 = only player 1 gets the wider windows, 1 = only player 2, -1 = both
+ *   BTL_WIN_LENIENT_INPUT 1 = every press re-opens its window (the original ignores a press while the window is open
+ *                         or cooling down, and a second press closes it), and the counter also fires with Up HELD
+ *                         and Rush pressed. 0 = the original rules with the wider windows.
+ * Off in the Cheats tab: the original game. Changes the fight state, so it is never on in an online match. */
+#ifndef BTL_WIN_ONLY_PLAYER
+#define BTL_WIN_ONLY_PLAYER 0
+#endif
+#ifndef BTL_WIN_EVADE_BONUS
+#define BTL_WIN_EVADE_BONUS 8
+#endif
+#ifndef BTL_WIN_GUARD_BONUS
+#define BTL_WIN_GUARD_BONUS 6
+#endif
+#ifndef BTL_WIN_COUNTER
+#define BTL_WIN_COUNTER 30
+#endif
+#ifndef BTL_WIN_SIDE_BONUS
+#define BTL_WIN_SIDE_BONUS 8
+#endif
+#ifndef BTL_WIN_LENIENT_INPUT
+#define BTL_WIN_LENIENT_INPUT 1
+#endif
+extern s32 BtlInput_IsPressed(BtlMoveChr *chr, u32 mask);
+
+extern s32 BtlInput_IsPressed(BtlMoveChr *chr, u32 mask);
+
+/* Per frame: the seven defence windows at chr+0x1068: each counts down to a floor and is re-opened by its input.
+   The mod menu (F12, include/battle/btl_mod.h) can lengthen four groups of them for the fighter on a game port:
+   +0x1068 the evasion of the first hit (vanish / teleport dodge), +0x106C / +0x107C / +0x1078 what a guard press opens
+   (dodge without a counter, rush break, throw break), +0x1070 the Up + Rush counter and +0x1074 guard + side. A
+   group with a level above 0 also takes every press: it is re-opened each time (the game ignores a press while the
+   window is open or cooling down, and a second press closes it), and the counter fires with Up held and Rush
+   pressed. Without a profile in effect every call below answers with the game's own value. */
 void BtlMove_UpdateDefenseTimers(BtlMoveChr *chr) {
+    s32 pad = BTL_MOD_PROFILE(chr); /* the mod menu's profile for this fighter, -1: none */
+    s32 evadeBonus = Port_ModWindow(pad, BTL_MODWIN_VANISH);
+    s32 guardBonus = Port_ModWindow(pad, BTL_MODWIN_GUARD);
+    s32 counterWin = Port_ModWindow(pad, BTL_MODWIN_COUNTER);
+    s32 sideBonus = Port_ModWindow(pad, BTL_MODWIN_SIDE);
+    s32 lenV = Port_ModLenient(pad, BTL_MODWIN_VANISH);
+    s32 lenG = Port_ModLenient(pad, BTL_MODWIN_GUARD);
+    s32 lenC = Port_ModLenient(pad, BTL_MODWIN_COUNTER);
+    s32 lenS = Port_ModLenient(pad, BTL_MODWIN_SIDE);
     s32 on = BtlInput_TestAction(chr, 0x27, 1);
     f32 hp = BtlMember_GetHealthRatio(chr);
+    s32 counterIn = BtlInput_TestAction(chr, 0x26, 1);
+    s32 sideIn = BtlInput_TestAction(chr, 0x2B, 1);
+    s32 evadeWin;
+    s32 rushWin;
 
+    if (lenC && BtlInput_IsPressed(chr, 0x8) && BtlInput_IsHeld(chr, 0x10)) {
+        counterIn = 1;
+    }
     if (!BtlChar_TestFlag(chr, 5)) {
         on = 0;
     }
+    if (hp < 0.3f) {
+        evadeWin = 2 + evadeBonus;
+    } else if (hp < 0.7f) {
+        evadeWin = 3 + evadeBonus;
+    } else {
+        evadeWin = 4 + evadeBonus;
+    }
+    rushWin = (BtlChar_TestFlag(chr, 0x138) ? 4 : 2) + guardBonus;
     if (BtlChar_TestFlag(chr, 0x12C)) {
         chr->unk1068 = -30;
         chr->unk106C = -30;
         chr->unk107C = -30;
     }
     chr->unk1068--;
-    if (chr->unk1068 < -30) {
+    if (lenV) {
+        if (chr->unk1068 < -30 || chr->unkFB0 != 1) {
+            chr->unk1068 = -30;
+        }
+        if (on) {
+            chr->unk1068 = evadeWin;
+        }
+    } else if (chr->unk1068 < -30) {
         chr->unk1068 = -30;
         if (on) {
-            if (hp < 0.3f) {
-                chr->unk1068 = 2;
-            } else if (hp < 0.7f) {
-                chr->unk1068 = 3;
-            } else {
-                chr->unk1068 = 4;
-            }
+            chr->unk1068 = evadeWin;
         }
     } else {
         if (on) {
@@ -1650,14 +1716,17 @@ void BtlMove_UpdateDefenseTimers(BtlMoveChr *chr) {
         }
     }
     chr->unk106C--;
-    if (chr->unk106C < -30) {
+    if (lenG) {
+        if (chr->unk106C < -30) {
+            chr->unk106C = -30;
+        }
+        if (on) {
+            chr->unk106C = rushWin;
+        }
+    } else if (chr->unk106C < -30) {
         chr->unk106C = -30;
         if (on) {
-            if (BtlChar_TestFlag(chr, 0x138)) {
-                chr->unk106C = 4;
-            } else {
-                chr->unk106C = 2;
-            }
+            chr->unk106C = rushWin;
         }
     } else {
         if (on) {
@@ -1665,39 +1734,63 @@ void BtlMove_UpdateDefenseTimers(BtlMoveChr *chr) {
         }
     }
     chr->unk1070--;
-    if (chr->unk1070 < -30) {
+    if (lenC) {
+        if (chr->unk1070 < -30) {
+            chr->unk1070 = -30;
+        }
+        if (counterIn) {
+            chr->unk1070 = counterWin;
+        }
+    } else if (chr->unk1070 < -30) {
         chr->unk1070 = -30;
-        if (BtlInput_TestAction(chr, 0x26, 1)) {
-            chr->unk1070 = 1;
+        if (counterIn) {
+            chr->unk1070 = counterWin;
         }
     } else {
-        if (BtlInput_TestAction(chr, 0x26, 1)) {
+        if (counterIn) {
             chr->unk1070 = -1;
         }
     }
     chr->unk1074--;
-    if (chr->unk1074 < -15) {
+    if (lenS) {
+        if (chr->unk1074 < -15) {
+            chr->unk1074 = -15;
+        }
+        if (sideIn && (BtlParam_GetFlags2(chr) & 0x20)) {
+            chr->unk1074 = 5 + sideBonus;
+        }
+    } else if (chr->unk1074 < -15) {
         chr->unk1074 = -15;
-        if (BtlInput_TestAction(chr, 0x2B, 1) && (BtlParam_GetFlags2(chr) & 0x20)) {
+        if (sideIn && (BtlParam_GetFlags2(chr) & 0x20)) {
             chr->unk1074 = 5;
         }
     }
     chr->unk1078--;
-    if (chr->unk1078 < -30) {
+    if (lenG) {
+        if (chr->unk1078 < -30) {
+            chr->unk1078 = -30;
+        }
+        if (on) {
+            chr->unk1078 = 5 + guardBonus;
+        }
+    } else if (chr->unk1078 < -30) {
         chr->unk1078 = -30;
         if (on) {
             chr->unk1078 = 5;
         }
     }
     chr->unk107C--;
-    if (chr->unk107C < -30) {
+    if (lenG) {
+        if (chr->unk107C < -30) {
+            chr->unk107C = -30;
+        }
+        if (on) {
+            chr->unk107C = rushWin;
+        }
+    } else if (chr->unk107C < -30) {
         chr->unk107C = -30;
         if (on) {
-            if (BtlChar_TestFlag(chr, 0x138)) {
-                chr->unk107C = 4;
-            } else {
-                chr->unk107C = 2;
-            }
+            chr->unk107C = rushWin;
         }
     } else {
         if (on) {

@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_char_status.h"
+#include "battle/btl_mod.h"
 
 /*
  * Fighter stat modifiers, 0x1C2FF0..0x1C3CA8. See battle/btl_char_status.h for the structures.
@@ -351,7 +352,7 @@ s32 BtlStat_GetBlastGainBonus(BtlStatChr *chr) {
 
 /* Curve row 4 at level 1. */
 f32 BtlStat_GetMeleeDamageScale(BtlStatChr *chr) {
-    return BtlStat_EvalCurve(BtlStat_GetLevel1(chr), 4);
+    return BtlStat_EvalCurve(BtlStat_GetLevel1(chr), 4) * ((f32)Port_ModPercent(BTL_MOD_PROFILE(chr), BTL_MODPCT_MELEE) / 100.0f);
 }
 
 /* Curve row 5 at level 1. */
@@ -361,7 +362,7 @@ f32 BtlStat_GetGuardKiCostScale(BtlStatChr *chr) {
 
 /* Curve row 6 at level 1. */
 f32 BtlStat_GetKiBlastDamageScale(BtlStatChr *chr) {
-    return BtlStat_EvalCurve(BtlStat_GetLevel1(chr), 6);
+    return BtlStat_EvalCurve(BtlStat_GetLevel1(chr), 6) * ((f32)Port_ModPercent(BTL_MOD_PROFILE(chr), BTL_MODPCT_BLAST) / 100.0f);
 }
 
 /* Curve row 7 at level 2. */
@@ -371,7 +372,7 @@ f32 BtlStat_GetScale7(BtlStatChr *chr) {
 
 /* Curve row 8 at level 3. */
 f32 BtlStat_GetSpeedScale(BtlStatChr *chr) {
-    return BtlStat_EvalCurve(BtlStat_GetLevel3(chr), 8);
+    return BtlStat_EvalCurve(BtlStat_GetLevel3(chr), 8) * ((f32)Port_ModPercent(BTL_MOD_PROFILE(chr), BTL_MODPCT_SPEED) / 100.0f);
 }
 
 /* Curve row 9 at level 5. */

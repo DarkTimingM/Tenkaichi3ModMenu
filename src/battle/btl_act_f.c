@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_act_f.h"
+#include "battle/btl_mod.h"
 
 /*
  * Blast 2 / Ultimate Blast actions: 0x1F5460..0x1FC2B0, in two parts (to 0x1F8C00, and from there the rush
@@ -1655,6 +1656,7 @@ extern void BtlChar_SetSmallVibration(ActGChr *chr, f32 seconds);
 #define ChrCam_EndCut ((void (*)(ActGChr *chr))ChrCam_EndCut)
 #define ChrCam_RequestCut ((void (*)(ActGChr *chr, s32 arg1, s32 arg2))ChrCam_RequestCut)
 #define BtlInput_TestAction ((s32 (*)(ActGChr *chr, s32 id, s32 want))BtlInput_TestAction)
+extern s32 BtlInput_IsPressed(ActGChr *chr, u32 mask); /* (the mod menu: any button counts in a clash) */
 #define BtlMember_SpendKi ((void (*)(ActGChr *chr, s32 amount, s32 arg2))BtlMember_SpendKi)
 extern f32 BtlOpp_GetGapXZ(ActGChr *chr);
 extern void BtlColl_SetFramesToReach(ActGChr *chr, f32 scale);
@@ -3000,6 +3002,7 @@ void BtlAct_ClashStruggleHandler(ActGChr *chr, s32 phase) {
         } else if (BtlMember_HasAbility(chr, 0x68)) {
             chr->clashPower -= 3;
         }
+        chr->clashPower += Port_ModClashStart(BTL_MOD_PROFILE(chr)); /* (the mod menu: 0 without a profile) */
     }
     if (phase == 1) {
         s32 up = -1;
@@ -3037,8 +3040,9 @@ void BtlAct_ClashStruggleHandler(ActGChr *chr, s32 phase) {
         BtlChar_SetFlag(chr, 0x45);
         BtlChar_SetFlag(chr, 0x46);
         BtlChar_SetFlag(chr, 0x134);
-        if (chr->actionFrame >= 0x10 && BtlInput_TestAction(chr, 0x33, 1)) {
-            chr->clashPower++;
+        if (chr->actionFrame >= 0x10 &&
+            (BtlInput_TestAction(chr, 0x33, 1) || (Port_ModClashAny(BTL_MOD_PROFILE(chr)) && BtlInput_IsPressed(chr, 0xF)))) {
+            chr->clashPower += Port_ModClashPoints(BTL_MOD_PROFILE(chr), BTL_CHR_SIDE(chr)); /* (1 without a profile) */
 #ifdef PORT /* PC build: BT3_CLASH_LOG=1 says what a clash counts (testing the Square option) */
             Port_ClashLog(chr->player, "beam clash", 1, chr->clashPower, chr->actionFrame);
 #endif

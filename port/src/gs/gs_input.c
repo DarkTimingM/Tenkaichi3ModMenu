@@ -475,6 +475,39 @@ static SDL_Gamepad *pad_of(int player) {
     return NULL;
 }
 
+/* The controller on a game port (0 / 1): its GUID and its name, for the mod menu's controller filter (plat_stub.c,
+   PortMod_Resolve). 0 when no controller is on that port (a keyboard player, a fighter the CPU plays). */
+int PortInput_SocketPad(int socket, char *guid, int gsz, char *name, int nsz, int *ord) {
+    const char *n;
+    int slot, i;
+
+    if (socket < 0 || socket > 1) {
+        return 0;
+    }
+    pthread_once(&sLoadOnce, load);
+    slot = sPadSlot[socket];
+    if (slot < 0 || slot >= sIdCount) {
+        return 0;
+    }
+    SDL_GUIDToString(SDL_GetJoystickGUIDForID(sIds[slot]), guid, gsz);
+    n = SDL_GetGamepadNameForID(sIds[slot]);
+    snprintf(name, (size_t)nsz, "%s", n != NULL ? n : "");
+    if (ord != NULL) { /* ord[0] / ord[1]: how many controllers before this one (SDL's order) have its GUID / its name,
+                          which tells two identical controllers apart */
+        SDL_GUID mine = SDL_GetJoystickGUIDForID(sIds[slot]);
+
+        ord[0] = ord[1] = 0;
+        for (i = 0; i < slot; i++) {
+            SDL_GUID other = SDL_GetJoystickGUIDForID(sIds[i]);
+            const char *on = SDL_GetGamepadNameForID(sIds[i]);
+
+            ord[0] += memcmp(&mine, &other, sizeof(mine)) == 0;
+            ord[1] += n != NULL && on != NULL && strcmp(n, on) == 0;
+        }
+    }
+    return 1;
+}
+
 /* BT3_PAD="frame:button,frame:button,...": scripted presses for player 1, each held for 4 frames from that frame
    (frame = the renderer's frame counter). Buttons: start select up down left right cross circle square triangle
    l1 r1 l2 r2. For tests without a person at the keyboard. */

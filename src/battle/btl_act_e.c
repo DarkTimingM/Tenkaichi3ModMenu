@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_act_e.h"
+#include "battle/btl_mod.h"
 
 /*
  * Fighter action handlers, 0x1F1930..0x1F5460: actions 0x1A..0x35 and 0xFA..0xFC.
@@ -1337,6 +1338,7 @@ s32 BtlAct_VanishDashHandler(BtlActEChr *chr, s32 phase) {
  */
 void BtlAct_ClashBlowsHandler(BtlActEChr *chr, s32 phase) {
     s32 *bonus = &chr->work[2];
+    s32 points;
 
     if (phase == 0) {
         BtlAnim_Play(chr, chr->player == 0 ? 0x173 : 0x174, 0.15f);
@@ -1364,8 +1366,11 @@ void BtlAct_ClashBlowsHandler(BtlActEChr *chr, s32 phase) {
                 BtlAnim_AdvanceLoop(chr, 0);
                 BtlChar_SetFlag(chr, 0xE6);
                 BtlChar_SetFlag(chr, 0xED);
-                if (BtlInput_TestAction(chr, 0x33, 1)) {
-                    BtlAct_CountAndMarkOpponent(chr);
+                if (BtlInput_TestAction(chr, 0x33, 1) || (Port_ModClashAny(BTL_MOD_PROFILE(chr)) && BtlInput_IsPressed(chr, 0xF))) {
+                    points = Port_ModClashPoints(BTL_MOD_PROFILE(chr), BTL_CHR_SIDE(chr)); /* (1 without a profile) */
+                    do {
+                        BtlAct_CountAndMarkOpponent(chr);
+                    } while (--points > 0);
 #ifdef PORT /* PC build: BT3_CLASH_LOG=1 */
                     Port_ClashLog(chr->player, "blow clash", 1, chr->clashCountB, chr->actionFrame);
 #endif

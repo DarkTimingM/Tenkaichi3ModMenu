@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_tech_a.h"
+#include "battle/btl_mod.h"
 
 /*
  * Fighter queries by side, the attack records and the character parameter block, 0x20BA80..0x20F0E8 (124 functions).
@@ -1020,6 +1021,13 @@ s32 BtlAtk_GetThrowParamE(BtlTechChr *chr) {
     return BtlAtk_GetRecord(chr, NULL)->throwE;
 }
 
+/* The mod menu's percent for a charge rate or the ki per hit (ki charge, skill gauge gain, ki gain); 100 changes nothing. */
+static s32 BtlParam_ModRate(BtlTechChr *chr, s32 what, s32 rate) {
+    s32 pct = Port_ModPercent(BTL_MOD_PROFILE(chr), what);
+
+    return pct == 100 ? rate : rate * pct / 100;
+}
+
 /* Ki the attacker gains per hit: record +0x0A, +50% (ability 0x6E) or +25% (0x20), divided by the hit count. */
 s32 BtlAtk_GetKiGain(BtlTechChr *chr) {
     BtlTechObj *obj = BtlChar_GetObj(chr);
@@ -1035,7 +1043,7 @@ s32 BtlAtk_GetKiGain(BtlTechChr *chr) {
     if (hits > 0) {
         val /= hits;
     }
-    return val;
+    return BtlParam_ModRate(chr, BTL_MODPCT_KIHIT, val); /* (the mod menu's percent: 100 changes nothing) */
 }
 
 /* Ki the defender pays when it guards: record +0x08 * curve row 5, x2 (ability 0x44) or x1.5 (0x6D). */
@@ -1583,12 +1591,12 @@ s32 BtlParam_GetCount80(BtlTechChr *chr) {
             v = 1;
         }
     }
-    return v;
+    return BtlParam_ModRate(chr, BTL_MODPCT_BLASTLIMIT, v); /* (the mod menu: 100 changes nothing, a limit of 0 stays 0) */
 }
 
 /* Parameter +0x82: the same limit for class-1 blasts. */
 s32 BtlParam_GetUnk82(BtlTechChr *chr) {
-    return BtlChar_GetObj(chr)->param->blastLimitB;
+    return BtlParam_ModRate(chr, BTL_MODPCT_BLASTLIMIT, BtlChar_GetObj(chr)->param->blastLimitB);
 }
 
 /* Parameter +0x84 + n (n above 3 reads entry 0). */
@@ -1670,7 +1678,7 @@ s32 BtlParam_GetRateA(BtlTechChr *chr) {
     s32 v = BtlChar_GetObj(chr)->param->kiCharge / 30;
 
     v += BtlStat_GetKiChargeBonus(chr);
-    return BtlUtil_Max(BtlParam_ScaleKiCharge(chr, v + chr->rateBonus / 30), 200);
+    return BtlParam_ModRate(chr, BTL_MODPCT_KI, BtlUtil_Max(BtlParam_ScaleKiCharge(chr, v + chr->rateBonus / 30), 200));
 }
 
 /* The same from parameter +0x34: used while the fighter has flag 0x11. */
@@ -1678,14 +1686,14 @@ s32 BtlParam_GetRateB(BtlTechChr *chr) {
     s32 v = BtlChar_GetObj(chr)->param->kiChargeWater / 30;
 
     v += BtlStat_GetKiChargeBonus(chr);
-    return BtlUtil_Max(BtlParam_ScaleKiCharge(chr, v + chr->rateBonus / 30), 200);
+    return BtlParam_ModRate(chr, BTL_MODPCT_KI, BtlUtil_Max(BtlParam_ScaleKiCharge(chr, v + chr->rateBonus / 30), 200));
 }
 
 /* Ki regenerated per frame below BtlParam_GetKiRegenLimit: (parameter +0x38) / 30 + curve row 1, at least 0. */
 s32 BtlParam_GetKiRegenRate(BtlTechChr *chr) {
     s32 v = BtlChar_GetObj(chr)->param->kiRegen / 30;
 
-    return BtlUtil_Max(v + BtlStat_GetKiRegenBonus(chr), 0);
+    return BtlParam_ModRate(chr, BTL_MODPCT_KIREGEN, BtlUtil_Max(v + BtlStat_GetKiRegenBonus(chr), 0));
 }
 
 /* Ki recovered per frame in the ki-exhausted state (x4 by the caller on a button press): (parameter +0x3C) / 30 +
@@ -1754,7 +1762,7 @@ s32 BtlParam_GetBlastGainRate(BtlTechChr *chr) {
     if (BtlMember_HasAbility(chr, 0x33)) {
         v = v * 8 / 10;
     }
-    return BtlUtil_Max(v, 20);
+    return BtlParam_ModRate(chr, BTL_MODPCT_GAUGE, BtlUtil_Max(v, 20));
 }
 
 /* Max power gained per frame of charging at full ki: 30000 (the whole gauge) divided by the frames in

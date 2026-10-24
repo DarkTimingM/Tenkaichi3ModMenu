@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_char_member.h"
+#include "battle/btl_mod.h"
 
 /*
  * Team members, parameters and gauges of a fighter: 0x1CDCA8..0x1CF578.
@@ -564,10 +565,12 @@ s32 BtlMember_SpendKi(BtlMemberChr *chr, s32 amount, s32 force) {
     if (force == 0 && BtlChar_TestFlag(chr, 6)) {
         return 0;
     }
-    g->ki -= amount;
-    if (g->ki < 0) {
-        g->ki = 0;
-        ranOut = 1;
+    if (!Port_ModFlag(BTL_MOD_PROFILE(chr), BTL_MODFLAG_INFKI)) { /* (the mod menu: infinite ki spends nothing) */
+        g->ki -= amount;
+        if (g->ki < 0) {
+            g->ki = 0;
+            ranOut = 1;
+        }
     }
     g->maxPower = 0;
     return ranOut;

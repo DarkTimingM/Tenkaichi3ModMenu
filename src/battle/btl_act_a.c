@@ -1,5 +1,6 @@
 #include "common.h"
 #include "battle/btl_act_a.h"
+#include "battle/btl_mod.h"
 
 /*
  * Fighter action handlers, first group: 0x1E3158..0x1EA5F8 (two parts: to 0x1E6CC0, and from there; the second
@@ -763,7 +764,7 @@ s32 BtlAct_SmashChargeHandler(BtlActAChr *chr, s32 phase) {
                         chr->work[0] |= 1;
                     }
                     if (chr->work[0] & 1) {
-                        if (chr->unkD84 == 1) {
+                        if (chr->unkD84 >= 1 && chr->unkD84 <= Port_ModWindow(BTL_MOD_PROFILE(chr), BTL_MODWIN_SMASH)) { /* (perfect: released on the first full frame; the mod menu widens it) */
                             BtlChar_SetHeldFlag(chr, 0x84);
                         } else if (chr->unkD84 > 0 && BtlAct_TestPoweredSkill(chr, 0x200) && BtlChar_TestFlag(chr, 0x13)) {
                             id = 0x51;

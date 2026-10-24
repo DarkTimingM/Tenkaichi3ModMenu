@@ -124,6 +124,369 @@ void Port_GameSpeedSet(int percent) {
         Port_SettingSave("game_speed", percent);
     }
 }
+
+/* ---- the mod menu (F12; port_mod.h) ------------------------------------------------------------------------------
+   Profiles of the player's own tuning: the defence windows, the damage of each kind of attack, the charge rates and how
+   easily a clash is won. A profile matches a fighter by who plays it (a person or the CPU), the game port it reads, the
+   controller that drives it (its GUID or its name, chosen in the menu) and its character and form; the most specific
+   one that matches is in effect. Never in an online match. (PORT_HOST: not the game's state.) */
+extern int PortInput_SocketPad(int socket, char *guid, int gsz, char *name, int nsz, int *ord); /* gs/gs_input.c */
+extern void Port_SettingTextSave(const char *name, const char *value);
+extern void Port_SettingText(const char *name, const char *def, char *out, int size);
+#include "port_mod.h"
+
+PORT_HOST static PortModProfile sMod[PORTMOD_PROFILES];
+PORT_HOST static PortModSeen sSeen[2];
+PORT_HOST static int sClashAcc[2];
+PORT_HOST static PortModHost sHost;
+PORT_HOST static int sModLoaded;
+
+static int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void mod_defaults(PortModProfile *p) {
+    memset(p, 0, sizeof(*p));
+    p->who = PORTMOD_WHO_PLAYER;
+    p->port = -1;
+    p->chara = p->costume = -1;
+    p->dMelee = p->dBlast = p->dSp1 = p->dSp2 = p->dUlt = 100;
+    p->kiCharge = p->gaugeGain = p->kiHit = 100;
+    p->clashPow = 100;
+    p->cSuper = p->cUlt = p->cBlast = p->cMove = 100;
+    p->kiRegen = p->taken = p->speed = 100;
+    p->blastLimit = p->blastSpeed = 100;
+}
+
+static void mod_load(void);
+
+void PortMod_Reset(int index) { /* the values only: who it applies to stays */
+    PortModProfile *p;
+    PortModProfile d;
+
+    mod_load();
+    p = &sMod[clampi(index, 0, PORTMOD_PROFILES - 1)];
+    mod_defaults(&d);
+    p->tCounter = p->tVanish = p->tGuard = p->tSide = p->tSmash = 0;
+    p->cSuper = d.cSuper; p->cUlt = d.cUlt; p->cBlast = d.cBlast; p->cMove = d.cMove;
+    p->kiRegen = d.kiRegen; p->taken = d.taken; p->speed = d.speed;
+    p->blastLimit = d.blastLimit; p->blastSpeed = d.blastSpeed;
+    p->freeSuper = p->freeUlt = p->infKi = 0;
+    p->dMelee = d.dMelee; p->dBlast = d.dBlast; p->dSp1 = d.dSp1; p->dSp2 = d.dSp2; p->dUlt = d.dUlt;
+    p->kiCharge = d.kiCharge; p->gaugeGain = d.gaugeGain; p->kiHit = d.kiHit;
+    p->clashPow = d.clashPow; p->clashAny = 0; p->clashStart = 0;
+}
+
+void PortMod_Create(int index) {
+    PortModProfile *p;
+
+    mod_load();
+    p = &sMod[clampi(index, 0, PORTMOD_PROFILES - 1)];
+    mod_defaults(p);
+    p->used = 1;
+    p->on = 1;
+}
+
+void PortMod_Clear(int index) {
+    PortModProfile *p;
+
+    mod_load();
+    p = &sMod[clampi(index, 0, PORTMOD_PROFILES - 1)];
+    mod_defaults(p);
+}
+
+static void mod_name(char *out, int size, int index, const char *key) {
+    snprintf(out, (size_t)size, "p%02d_%s", index + 1, key);
+}
+
+/* (one table of the ints, by offset, so that loading and saving cannot drift apart) */
+#include <stddef.h>
+static int *mod_int(PortModProfile *p, int k, const char **key, int *lo, int *hi) {
+#define E(name, field, l, h) {name, offsetof(PortModProfile, field), l, h}
+    static const struct { const char *key; size_t off; int lo, hi; } t[] = {
+        E("used", used, 0, 1), E("on", on, 0, 1), E("who", who, 0, 2), E("port", port, -1, 1), E("ctl", useCtl, 0, 1),
+        E("match", match, 0, 1), E("exact", exact, 0, 1), E("ordg", ordG, 0, 7), E("ordn", ordN, 0, 7),
+        E("chara", chara, -1, 4095), E("cost", costume, -1, 255),
+        E("tcnt", tCounter, 0, PORTMOD_MAX_LEVEL), E("tvan", tVanish, 0, PORTMOD_MAX_LEVEL),
+        E("tgrd", tGuard, 0, PORTMOD_MAX_LEVEL), E("tsid", tSide, 0, PORTMOD_MAX_LEVEL), E("tsmash", tSmash, 0, PORTMOD_MAX_LEVEL),
+        E("dmel", dMelee, 0, 1000), E("dbla", dBlast, 0, 1000), E("dsp1", dSp1, 0, 1000), E("dsp2", dSp2, 0, 1000),
+        E("dult", dUlt, 0, 1000), E("kich", kiCharge, 10, 1000), E("gage", gaugeGain, 10, 1000), E("kihit", kiHit, 0, 1000),
+        E("cpow", clashPow, 100, 1000), E("cany", clashAny, 0, 1), E("cstart", clashStart, 0, 50),
+        E("csuper", cSuper, 0, 1000), E("cult", cUlt, 0, 1000), E("cblast", cBlast, 0, 1000), E("cmove", cMove, 0, 1000),
+        E("regen", kiRegen, 0, 1000), E("taken", taken, 0, 1000), E("speed", speed, 50, 200),
+        E("fsuper", freeSuper, 0, 1), E("fult", freeUlt, 0, 1), E("infki", infKi, 0, 1),
+        E("blim", blastLimit, 100, 500), E("bspd", blastSpeed, 25, 400),
+    };
+#undef E
+
+    if (k < 0 || k >= (int)(sizeof(t) / sizeof(t[0]))) {
+        return NULL;
+    }
+    *key = t[k].key;
+    *lo = t[k].lo;
+    *hi = t[k].hi;
+    return (int *)((char *)p + t[k].off);
+}
+
+static void mod_load(void) {
+    int i, k;
+
+    if (sModLoaded) {
+        return;
+    }
+    for (i = 0; i < PORTMOD_PROFILES; i++) {
+        PortModProfile *p = &sMod[i];
+        const char *key;
+        int lo, hi, *v;
+        char n[24];
+
+        mod_defaults(p);
+        for (k = 0; (v = mod_int(p, k, &key, &lo, &hi)) != NULL; k++) {
+            mod_name(n, sizeof(n), i, key);
+            *v = clampi(Port_Setting(n, *v), lo, hi);
+        }
+        mod_name(n, sizeof(n), i, "guid");  Port_SettingText(n, "", p->guid, (int)sizeof(p->guid));
+        mod_name(n, sizeof(n), i, "name");  Port_SettingText(n, "", p->name, (int)sizeof(p->name));
+        mod_name(n, sizeof(n), i, "label"); Port_SettingText(n, "", p->label, (int)sizeof(p->label));
+    }
+    sHost.on = Port_Setting("host_on", 0) != 0;
+    sHost.profile = clampi(Port_Setting("host_prof", 0), 0, PORTMOD_PROFILES - 1);
+    sHost.ordG = clampi(Port_Setting("host_ordg", 0), 0, 7);
+    Port_SettingText("host_guid", "", sHost.guid, (int)sizeof(sHost.guid));
+    Port_SettingText("host_name", "", sHost.name, (int)sizeof(sHost.name));
+    sModLoaded = 1;
+}
+
+PortModProfile *PortMod_Get(int index) {
+    mod_load();
+    return &sMod[clampi(index, 0, PORTMOD_PROFILES - 1)];
+}
+
+void PortMod_Save(int index) {
+    PortModProfile *p = PortMod_Get(index);
+    const char *key;
+    int lo, hi, *v, k;
+    char n[24];
+
+    index = clampi(index, 0, PORTMOD_PROFILES - 1);
+    for (k = 0; (v = mod_int(p, k, &key, &lo, &hi)) != NULL; k++) {
+        mod_name(n, sizeof(n), index, key);
+        Port_SettingSave(n, *v);
+    }
+    mod_name(n, sizeof(n), index, "guid");  Port_SettingTextSave(n, p->guid);
+    mod_name(n, sizeof(n), index, "name");  Port_SettingTextSave(n, p->name);
+    mod_name(n, sizeof(n), index, "label"); Port_SettingTextSave(n, p->label);
+}
+
+PortModHost *PortMod_Host(void) {
+    mod_load();
+    return &sHost;
+}
+
+void PortMod_HostSave(void) {
+    mod_load();
+    Port_SettingSave("host_on", sHost.on);
+    Port_SettingSave("host_prof", sHost.profile);
+    Port_SettingSave("host_ordg", sHost.ordG);
+    Port_SettingTextSave("host_guid", sHost.guid);
+    Port_SettingTextSave("host_name", sHost.name);
+}
+
+/* What a timing level means (0 = the game's own, 10 = extremely easy). Counter: the window's length in frames
+   (the game's is 1); the others: frames added to the game's (vanish 2..4 by health, guard escapes 2 / 4 / 5, side 5);
+   which 4, the Perfect Smash: how many frames from the first full frame of the charge still count as perfect (the game's 1). */
+int PortMod_Frames(int which, int level) {
+    static const int kCounter[PORTMOD_MAX_LEVEL + 1] = {1, 2, 3, 4, 6, 8, 10, 14, 20, 30, 45};
+    static const int kVanish[PORTMOD_MAX_LEVEL + 1] = {0, 1, 2, 3, 4, 6, 8, 10, 14, 20, 30};
+    static const int kGuard[PORTMOD_MAX_LEVEL + 1] = {0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 20};
+    static const int kSide[PORTMOD_MAX_LEVEL + 1] = {0, 1, 2, 3, 4, 6, 8, 10, 14, 20, 30};
+    static const int kSmash[PORTMOD_MAX_LEVEL + 1] = {1, 2, 3, 4, 5, 7, 9, 12, 16, 22, 30};
+
+    level = clampi(level, 0, PORTMOD_MAX_LEVEL);
+    return which == 0 ? kCounter[level] : which == 1 ? kVanish[level] : which == 2 ? kGuard[level] : which == 3 ? kSide[level] : kSmash[level];
+}
+
+/* The profile in effect for a fighter, or -1. A profile matches when every condition it sets holds; of the ones that
+   match the most specific wins (a character counts most, then a controller, then a game port, then who plays), the first
+   of equals. The fighter is also noted for the menu's "use this fighter" buttons. */
+int PortMod_Resolve(int side, int pad, int cpu, int chara, int costume) {
+    char guid[40], name[64];
+    int have = -1, ord[2] = {0, 0}, best = -1, bestScore = -1, i;
+
+    if (side >= 0 && side < 2) {
+        sSeen[side].seen = 1;
+        sSeen[side].pad = pad;
+        sSeen[side].cpu = cpu;
+        sSeen[side].chara = chara;
+        sSeen[side].costume = costume;
+    }
+    mod_load();
+    if (Port_NetSession() || Port_NetActive()) {
+        i = -1;
+        goto done;
+    }
+    if (sHost.on && sHost.guid[0] != '\0' && sHost.profile >= 0 && sHost.profile < PORTMOD_PROFILES &&
+        sMod[sHost.profile].used && !cpu && pad >= 0 && pad < 2) {
+        const PortModProfile *hp = &sMod[sHost.profile];
+
+        if (have < 0) {
+            have = PortInput_SocketPad(pad, guid, (int)sizeof(guid), name, (int)sizeof(name), ord);
+        }
+        if (have && strcmp(sHost.guid, guid) == 0 && sHost.ordG == ord[0] &&
+            (hp->chara < 0 || (hp->chara == chara && (hp->costume < 0 || hp->costume == costume)))) {
+            i = sHost.profile;
+            goto done;
+        }
+    }
+    for (i = 0; i < PORTMOD_PROFILES; i++) {
+        const PortModProfile *p = &sMod[i];
+        int score = 0;
+
+        if (!p->used || !p->on) {
+            continue;
+        }
+        if ((p->who == PORTMOD_WHO_PLAYER && cpu) || (p->who == PORTMOD_WHO_CPU && !cpu)) {
+            continue;
+        }
+        if (p->chara >= 0) {
+            if (p->chara != chara || (p->costume >= 0 && p->costume != costume)) {
+                continue;
+            }
+            score += 8;
+        }
+        if (p->useCtl) {
+            if (cpu || pad < 0 || pad >= 2) {
+                continue;
+            }
+            if (have < 0) {
+                have = PortInput_SocketPad(pad, guid, (int)sizeof(guid), name, (int)sizeof(name), ord);
+            }
+            if (!have ||
+                !(p->match == 0 ? p->guid[0] != '\0' && strcmp(p->guid, guid) == 0 : p->name[0] != '\0' && strcmp(p->name, name) == 0) ||
+                (p->exact && (p->match == 0 ? p->ordG != ord[0] : p->ordN != ord[1]))) {
+                continue;
+            }
+            score += 4;
+        }
+        if (p->port >= 0) {
+            if (p->port != pad) {
+                continue;
+            }
+            score += 2;
+        }
+        if (p->who != PORTMOD_WHO_BOTH) {
+            score += 1;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = i;
+        }
+    }
+    i = best;
+done:
+    if (side >= 0 && side < 2) {
+        sSeen[side].profile = i;
+    }
+    return i;
+}
+
+/* The name the game's code calls (include/battle/btl_mod.h). Whatever the game calls must be defined under exactly this
+   name: link.py stubs a missing symbol with a function that prints its name and exits, which is a game that closes the
+   moment a fight starts. */
+int Port_ModResolve(int side, int pad, int cpu, int chara, int costume) {
+    return PortMod_Resolve(side, pad, cpu, chara, costume);
+}
+
+const PortModSeen *PortMod_Seen(int side) {
+    return &sSeen[clampi(side, 0, 1)];
+}
+
+/* The calls the game makes (include/battle/btl_mod.h); `profile` is what PortMod_Resolve answered for the fighter. */
+static const PortModProfile *mod_p(int profile) {
+    return profile >= 0 && profile < PORTMOD_PROFILES ? &sMod[profile] : NULL;
+}
+
+static int mod_level(int profile, int which) {
+    const PortModProfile *p = mod_p(profile);
+
+    if (p == NULL) {
+        return 0;
+    }
+    return which == 0 ? p->tCounter : which == 1 ? p->tVanish : which == 2 ? p->tGuard : which == 3 ? p->tSide : p->tSmash;
+}
+
+int Port_ModWindow(int profile, int which) {
+    return PortMod_Frames(which, mod_level(profile, which));
+}
+
+int Port_ModLenient(int profile, int which) {
+    return mod_level(profile, which) > 0;
+}
+
+int Port_ModPercent(int profile, int what) {
+    const PortModProfile *p = mod_p(profile);
+
+    if (p == NULL) {
+        return 100;
+    }
+    switch (what) {
+    case 0: return p->dMelee;
+    case 1: return p->dBlast;
+    case 2: return p->dSp1;
+    case 3: return p->dSp2;
+    case 4: return p->dUlt;
+    case 5: return p->kiCharge;
+    case 6: return p->gaugeGain;
+    case 7: return p->kiHit;
+    case 8: return p->cSuper;
+    case 9: return p->cUlt;
+    case 10: return p->cBlast;
+    case 11: return p->cMove;
+    case 12: return p->kiRegen;
+    case 13: return p->taken;
+    case 14: return p->speed;
+    case 15: return p->blastLimit;
+    case 16: return p->blastSpeed;
+    }
+    return 100;
+}
+
+/* The on / off options: 0 attacks 1 and 2 cost no ki, 1 the ultimate costs no ki, 2 ki is never spent. */
+int Port_ModFlag(int profile, int what) {
+    const PortModProfile *p = mod_p(profile);
+
+    if (p == NULL) {
+        return 0;
+    }
+    return what == 0 ? p->freeSuper : what == 1 ? p->freeUlt : what == 2 ? p->infKi : 0;
+}
+
+/* Points one accepted input is worth in a clash: the percent / 100, the remainder carried over so that 150% is 1 and 2
+   points alternately. 1 without a profile or at 100%: the game's own. */
+int Port_ModClashPoints(int profile, int side) {
+    const PortModProfile *p = mod_p(profile);
+    int n;
+
+    if (p == NULL || p->clashPow <= 100 || side < 0 || side > 1) {
+        return 1;
+    }
+    sClashAcc[side] += p->clashPow;
+    n = sClashAcc[side] / 100;
+    sClashAcc[side] -= n * 100;
+    return n;
+}
+
+int Port_ModClashAny(int profile) {
+    const PortModProfile *p = mod_p(profile);
+
+    return p != NULL && p->clashAny;
+}
+
+int Port_ModClashStart(int profile) {
+    const PortModProfile *p = mod_p(profile);
+
+    return p != NULL ? p->clashStart : 0;
+}
 int Port_SpeedMilli(void) {
     return Port_NetSession() || Port_NetActive() ? Port_NetSpeedMilli() : Port_GameSpeed() * 10;
 }

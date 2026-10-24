@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlgpu3.h"
@@ -14,6 +15,7 @@
 #include "ui.h"
 #include "namefont.h"
 #include "../port_release.h"
+#include "../port_mod.h"
 #include "menu_text.h"
 #include "menu_translation.h"
 #include "../quit_dialog.h"
@@ -590,15 +592,36 @@ static void input_owner(void) {
     gPortOverlayOpen = up;
 }
 
+static bool sModMenu; // the open window is the mod menu (F12), not the settings
+
 static void set_open(bool open) {
     if (open && sChat) {
         chat_close();
     }
     sOpen = open;
     sNet = false;
+    if (!open) {
+        sModMenu = false;
+    }
     sCapKind = 0;
     gPortInputCapture = 0;
     input_owner();
+}
+
+// F12: opens the mod menu, closes it when it is the open window, and takes the place of the settings when they are.
+static void mod_toggle(void) {
+    if (!sReady || sQuit) {
+        return;
+    }
+    if (sOpen && sModMenu) {
+        set_open(false);
+    } else {
+        if (!sOpen) {
+            set_open(true);
+        }
+        sNet = false;
+        sModMenu = true;
+    }
 }
 
 static void capture(int kind, int player, int action) {
@@ -1135,6 +1158,10 @@ int Ui_Event(const SDL_Event *ev) {
     if (ev->type == SDL_EVENT_GAMEPAD_ADDED || ev->type == SDL_EVENT_GAMEPAD_REMOVED) { // (also while it is closed: its list of controllers)
         ImGui_ImplSDL3_ProcessEvent(ev);
         return 0;
+    }
+    if (ev->type == SDL_EVENT_KEY_DOWN && !ev->key.repeat && ev->key.key == SDLK_F12 && !sQuit && sCapKind == 0) {
+        mod_toggle();
+        return 1;
     }
     if (!sOpen && !sQuit && !sChat && PortInput_TboEvent(ev)) { // typed on a keypad of Tenkaichi Budokai Online
         return 1;
@@ -1679,6 +1706,7 @@ extern volatile int gPortUnlockAll, gPortUnlockDone;
 extern "C" int Port_GameSpeed(void);          // plat_stub.c: the player's own game speed, percent; never used online
 extern "C" void Port_GameSpeedSet(int percent);
 extern "C" void Port_AudioRefresh(void);
+extern "C" int Port_NetSession(void);        // gs/net.c (Port_NetActive is declared above)
 
 static void cheats_tab(void) {
     {
@@ -1838,6 +1866,8 @@ static void sticks_panel(int player) {
     }
 }
 
+static void host_row(void); // (below, with the rest of the code that keeps the profiles)
+
 static void controls_tab(void) {
     static int player;
     char label[96];
@@ -1874,6 +1904,7 @@ static void controls_tab(void) {
         PortInput_ResetDefaults(player);
         PortInput_Save();
     }
+    host_row();
     if (ImGui::CollapsingHeader("Sticks, triggers and vibration", ImGuiTreeNodeFlags_DefaultOpen)) {
         sticks_panel(player);
     }
@@ -1946,6 +1977,658 @@ static void controls_tab(void) {
             }
         }
         ImGui::EndTable();
+    }
+}
+
+// ---- the mod menu (F12): profiles that tune the defence windows, the damage, the charge rates and the clashes ---------
+// A profile applies to the fighters that match it: who plays them (a person, the CPU, both), the game port they read, the
+// controller that drives them (its GUID or name) and one character with one form of it; the most specific profile that
+// matches is the one in effect. plat_stub.c keeps them (port_mod.h) and the game's code asks them (include/battle/btl_mod.h).
+extern "C" const char *PortCharaName(int chara); // fight_panels_ui.cpp: the character table's names
+extern "C" int PortCharaCount(void);
+
+static int sModSel; // the profile open in the menu
+
+// How many controllers before ids[i] (SDL's order) have its GUID / its name: tells two identical controllers apart.
+static void mod_ordinals(const SDL_JoystickID *ids, int i, int *ordG, int *ordN) {
+    SDL_GUID mine = SDL_GetJoystickGUIDForID(ids[i]);
+    const char *n = SDL_GetGamepadNameForID(ids[i]);
+
+    *ordG = *ordN = 0;
+    for (int k = 0; k < i; k++) {
+        SDL_GUID other = SDL_GetJoystickGUIDForID(ids[k]);
+        const char *on = SDL_GetGamepadNameForID(ids[k]);
+
+        *ordG += memcmp(&mine, &other, sizeof(mine)) == 0;
+        *ordN += n != NULL && on != NULL && strcmp(n, on) == 0;
+    }
+}
+
+static bool mod_contains_ci(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+
+    for (; *hay != '\0'; hay++) {
+        size_t k = 0;
+
+        while (k < n && hay[k] != '\0' && tolower((unsigned char)hay[k]) == tolower((unsigned char)needle[k])) {
+            k++;
+        }
+        if (k == n) {
+            return true;
+        }
+    }
+    return n == 0;
+}
+
+static bool mod_level_row(const char *label, int *level, int which, const char *tip) {
+    char txt[48];
+    bool ch;
+
+    ImGui::SetNextItemWidth(260.0f);
+    ch = ImGui::SliderInt(label, level, 0, PORTMOD_MAX_LEVEL, "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("%s", tip);
+    if (which == 0 || which == 4) {
+        snprintf(txt, sizeof(txt), "%d frame%s (the game's: 1)", PortMod_Frames(which, *level), PortMod_Frames(which, *level) == 1 ? "" : "s");
+    } else {
+        snprintf(txt, sizeof(txt), *level == 0 ? "the game's own" : "+%d frames", PortMod_Frames(which, *level));
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", txt);
+    return ch;
+}
+
+static bool mod_check(const char *label, int *v, const char *tip) {
+    bool on = *v != 0;
+    bool ch = ImGui::Checkbox(label, &on);
+
+    if (ch) {
+        *v = on ? 1 : 0;
+    }
+    ImGui::SetItemTooltip("%s", tip);
+    return ch;
+}
+
+static bool mod_percent_row(const char *label, int *pct, int lo, int hi, const char *tip) {
+    bool ch;
+
+    ImGui::SetNextItemWidth(260.0f);
+    ch = ImGui::SliderInt(label, pct, lo, hi, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("%s", tip);
+    return ch;
+}
+
+// What a slot says in the list: its name, else the character and the controller it is for.
+static void mod_summary(const PortModProfile *p, char *out, int size) {
+    char what[96];
+    const char *nm = p->chara >= 0 ? PortCharaName(p->chara) : NULL;
+
+    if (p->label[0] != '\0') {
+        snprintf(out, (size_t)size, "%s", p->label);
+        return;
+    }
+    snprintf(what, sizeof(what), "%s", p->chara >= 0 ? (nm != NULL ? nm : "Character ?") : "Any character");
+    if (p->useCtl && p->name[0] != '\0') {
+        snprintf(out, (size_t)size, "%s, %s", what, p->name);
+    } else if (p->port >= 0) {
+        snprintf(out, (size_t)size, "%s, port %d", what, p->port + 1);
+    } else {
+        snprintf(out, (size_t)size, "%s%s", what, p->who == PORTMOD_WHO_CPU ? ", CPU" : p->who == PORTMOD_WHO_BOTH ? ", everyone" : "");
+    }
+}
+
+static bool mod_tab_applies(int index, PortModProfile *p) {
+    bool ch = false;
+    char label[200], guid[40];
+    int count = 0;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Who plays the fighter");
+    ImGui::SetNextItemWidth(260.0f);
+    if (ImGui::Combo("##who", &p->who, "The people playing\0The CPU\0Both\0")) {
+        ch = true;
+    }
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Game port the fighter reads");
+    {
+        int at = p->port + 1;
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::Combo("##port", &at, "Any port\0Port 1 (player 1)\0Port 2 (player 2)\0")) {
+            p->port = at - 1;
+            ch = true;
+        }
+    }
+    ImGui::Separator();
+
+    {
+        bool use = p->useCtl != 0;
+
+        if (ImGui::Checkbox("Only the fighter this controller drives", &use)) {
+            p->useCtl = use ? 1 : 0;
+            ch = true;
+        }
+        ImGui::SetItemTooltip("The profile follows the controller: plugged in as player 2, it is player 2's fighter that gets it.\n"
+                              "A keyboard player or a fighter the CPU plays has no controller: no effect.");
+    }
+    ImGui::BeginDisabled(!p->useCtl);
+    ImGui::Indent();
+    {
+        SDL_JoystickID *ids = SDL_GetGamepads(&count);
+        bool known = false;
+
+        if (p->guid[0] == '\0') {
+            snprintf(label, sizeof(label), "Choose a controller...");
+        } else {
+            for (int i = 0; i < count; i++) {
+                SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof(guid));
+                known = known || strcmp(guid, p->guid) == 0;
+            }
+            snprintf(label, sizeof(label), "%s  [%s]%s", p->name[0] != '\0' ? p->name : "(unnamed)", p->guid, known ? "" : "  (not connected)");
+        }
+        ImGui::SetNextItemWidth(520.0f);
+        if (ImGui::BeginCombo("##pad", label)) {
+            for (int i = 0; i < count; i++) {
+                const char *n = SDL_GetGamepadNameForID(ids[i]);
+                int og, on;
+
+                SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof(guid));
+                snprintf(label, sizeof(label), "%d: %s  [%s]", i + 1, n != NULL ? n : "?", guid);
+                mod_ordinals(ids, i, &og, &on);
+                if (ImGui::Selectable(label, strcmp(guid, p->guid) == 0 && (!p->exact || p->ordG == og))) {
+                    snprintf(p->guid, sizeof(p->guid), "%s", guid);
+                    snprintf(p->name, sizeof(p->name), "%s", n != NULL ? n : "");
+                    p->ordG = og;
+                    p->ordN = on;
+                    p->exact = 1; // (it is this controller that was clicked, not "any of that model")
+                    ch = true;
+                }
+            }
+            if (count == 0) {
+                ImGui::TextDisabled("No controller is connected.");
+            }
+            ImGui::EndCombo();
+        }
+        SDL_free(ids);
+    }
+    ImGui::TextUnformatted("Recognise it by");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("GUID", &p->match, 0)) {
+        ch = true;
+    }
+    ImGui::SetItemTooltip("The model's identifier. The same for two controllers of the same model.");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Name", &p->match, 1)) {
+        ch = true;
+    }
+    ImGui::SetItemTooltip("The name the controller reports. Also the same for two of the same model.");
+    {
+        bool exact = p->exact != 0;
+
+        if (ImGui::Checkbox("Only this exact controller (not another of the same model)", &exact)) {
+            p->exact = exact ? 1 : 0;
+            ch = true;
+        }
+        ImGui::SetItemTooltip("With two identical controllers the profile would reach both players.\n"
+                              "On: only the one chosen in the list, told apart by the order they are connected in.\n"
+                              "Choose the controller again after plugging them in a different order.");
+    }
+    ImGui::Unindent();
+    ImGui::EndDisabled();
+    ImGui::Separator();
+
+    ImGui::TextUnformatted("Character");
+    {
+        const char *nm = p->chara >= 0 ? PortCharaName(p->chara) : NULL;
+        static char filter[48];
+
+        if (p->chara < 0) {
+            snprintf(label, sizeof(label), "Any character");
+        } else {
+            snprintf(label, sizeof(label), "%d: %s", p->chara, nm != NULL ? nm : "?");
+        }
+        ImGui::SetNextItemWidth(420.0f);
+        if (ImGui::BeginCombo("##chara", label)) {
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##filter", "Type to filter...", filter, sizeof(filter));
+            if (ImGui::Selectable("Any character", p->chara < 0)) {
+                p->chara = p->costume = -1;
+                ch = true;
+            }
+            for (int i = 0; i < PortCharaCount(); i++) {
+                const char *name = PortCharaName(i);
+
+                if (name == NULL || !mod_contains_ci(name, filter)) {
+                    continue;
+                }
+                snprintf(label, sizeof(label), "%d: %s", i, name);
+                if (ImGui::Selectable(label, p->chara == i)) {
+                    p->chara = i;
+                    ch = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    for (int side = 0; side < 2; side++) {
+        const PortModSeen *s = PortMod_Seen(side);
+
+        if (side > 0) {
+            ImGui::SameLine();
+        }
+        ImGui::BeginDisabled(!s->seen || s->chara < 0);
+        snprintf(label, sizeof(label), "Use player %d's fighter", side + 1);
+        if (ImGui::Button(label)) {
+            p->chara = s->chara;
+            p->costume = s->costume;
+            ch = true;
+        }
+        ImGui::EndDisabled();
+        if (s->seen && s->chara >= 0) {
+            const char *nm = PortCharaName(s->chara);
+
+            ImGui::SetItemTooltip("In the match: %s (costume %d)", nm != NULL ? nm : "?", s->costume);
+        } else {
+            ImGui::SetItemTooltip("Start a match first: the fighters of the match are what this button reads.");
+        }
+    }
+    ImGui::BeginDisabled(p->chara < 0);
+    {
+        bool one = p->costume >= 0;
+
+        if (ImGui::Checkbox("Only this costume / form", &one)) {
+            p->costume = one ? 0 : -1;
+            ch = true;
+        }
+        if (p->costume >= 0) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::InputInt("##costume", &p->costume, 1, 1)) {
+                p->costume = p->costume < 0 ? 0 : p->costume > 255 ? 255 : p->costume;
+                ch = true;
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Each transformation is its own character in the game's table; the costume is the outfit.");
+    ImGui::Separator();
+
+    for (int side = 0; side < 2; side++) {
+        const PortModSeen *s = PortMod_Seen(side);
+
+        if (s->seen && s->profile == index) {
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.5f, 1.0f), "In effect now on player %d's fighter.", side + 1);
+        }
+    }
+    return ch;
+}
+
+static bool mod_tab_timing(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("0 is the game's own window, 10 the widest. Every press also re-opens the window.");
+    ch |= mod_level_row("Counter (Up + Rush)", &p->tCounter, 0,
+                        "The Up + Rush counter. The game gives it 1 frame, only while the two are pressed together.\n"
+                        "From level 1 it also fires with Up held and Rush pressed, and a new press always re-opens it.");
+    ch |= mod_level_row("Vanish / teleport dodge", &p->tVanish, 1,
+                        "The evasion of the first hit of an attack after a guard press (the game: 2 to 4 frames by health).");
+    ch |= mod_level_row("Guard-press escapes", &p->tGuard, 2,
+                        "The other windows a plain guard press (Circle) opens: a dodge that costs no counter, breaking a rush\n"
+                        "and breaking a throw (the game: 2 to 5 frames).");
+    ch |= mod_level_row("Guard + side dodge", &p->tSide, 3, "Guard and a side direction, for the characters that have it (the game: 5 frames).");
+    ch |= mod_level_row("Perfect Smash (level 3 charge)", &p->tSmash, 4,
+                        "A charged smash (hold Square + a direction) is perfect only if you release it on the very first frame\n"
+                        "the charge is full: it then lunges at 3500 km/h and cannot be interrupted. The game gives that 1 frame.\n"
+                        "The level keeps the release perfect for this many frames from the first full one.\n"
+                        "(A character with the powered smash skill gets the full smash instead when it releases later than that.)");
+    if (ImGui::Button("All 0")) { p->tCounter = p->tVanish = p->tGuard = p->tSide = p->tSmash = 0; ch = true; }
+    ImGui::SameLine();
+    if (ImGui::Button("All 3")) { p->tCounter = p->tVanish = p->tGuard = p->tSide = p->tSmash = 3; ch = true; }
+    ImGui::SameLine();
+    if (ImGui::Button("All 6")) { p->tCounter = p->tVanish = p->tGuard = p->tSide = p->tSmash = 6; ch = true; }
+    ImGui::SameLine();
+    if (ImGui::Button("All 10")) { p->tCounter = p->tVanish = p->tGuard = p->tSide = p->tSmash = 10; ch = true; }
+    return ch;
+}
+
+static bool mod_tab_ki(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("100% = the game's");
+    ch |= mod_percent_row("Ki charge", &p->kiCharge, 10, 1000, "How fast holding the charge button fills the ki gauge.");
+    ch |= mod_percent_row("Ki gained per hit", &p->kiHit, 0, 1000, "The ki this fighter gains for each hit it lands (0% = none).");
+    ch |= mod_percent_row("Skill gauge", &p->gaugeGain, 10, 1000, "How fast the blast stock (skill) gauge fills.");
+    ch |= mod_percent_row("Passive ki regeneration", &p->kiRegen, 0, 1000,
+                          "The ki that refills by itself. A character whose passive regeneration is 0 stays at 0.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ki costs (100% = the game's, 0% = free)");
+    ch |= mod_percent_row("Attacks 1 and 2", &p->cSuper, 0, 1000, "The ki the two special attacks cost.");
+    ch |= mod_percent_row("Ultimate", &p->cUlt, 0, 1000, "The ki the ultimate costs.");
+    ch |= mod_percent_row("Ki blasts", &p->cBlast, 0, 1000, "The ki a ki blast costs.");
+    ch |= mod_percent_row("Dashes and flight", &p->cMove, 0, 1000,
+                          "The ki that dashes, vanishes and the like drain each frame (one setting for all of those).");
+    ch |= mod_check("Free attacks 1 and 2", &p->freeSuper, "The two special attacks cost no ki at all.");
+    ch |= mod_check("Free ultimate", &p->freeUlt, "The ultimate costs no ki at all.");
+    ch |= mod_check("Infinite ki", &p->infKi,
+                    "Ki is never spent. The gauge stays full; the rest of what happens when ki is spent still happens.");
+    return ch;
+}
+
+static bool mod_tab_damage(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Damage this fighter deals (100% = the game's)");
+    ch |= mod_percent_row("Melee: Square, rushes, smashes, throws", &p->dMelee, 0, 1000, "Also scales the damage the guard takes from them.");
+    ch |= mod_percent_row("Ki blasts: Triangle", &p->dBlast, 0, 1000, "The ki blasts of the Triangle button, charged ones included.");
+    ch |= mod_percent_row("Attack 1", &p->dSp1, 0, 1000, "The first special attack (technique slot 2).");
+    ch |= mod_percent_row("Attack 2", &p->dSp2, 0, 1000, "The second special attack (technique slot 3).");
+    ch |= mod_percent_row("Ultimate", &p->dUlt, 0, 1000, "The Ultimate (technique slot 4).");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Damage this fighter takes (100% = the game's, 0% = none)");
+    ch |= mod_percent_row("Damage taken", &p->taken, 0, 1000, "Multiplies the damage this fighter receives from any attack.");
+    return ch;
+}
+
+static bool mod_tab_blasts(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("100% = the game's");
+    ch |= mod_percent_row("Ki blasts in a row", &p->blastLimit, 100, 500,
+                          "How many ki blasts this fighter can fire one after another and have alive at once. The game gives\n"
+                          "each character its own number; this multiplies it (a character that cannot fire blasts stays so).\n"
+                          "The CPU follows the same limit when it plays the fighter.");
+    ch |= mod_percent_row("Ki blast speed", &p->blastSpeed, 25, 400, "How fast the ki blasts travel.");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Their damage is in the Damage tab, what they cost in Ki / Skills.");
+    return ch;
+}
+
+static bool mod_tab_movement(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("100% = the game's");
+    ch |= mod_percent_row("Movement speed", &p->speed, 50, 200,
+                          "How fast this fighter flies, dashes and lunges. Kept between 50% and 200%: far from that\n"
+                          "the stage limits, hits and dodges stop making sense. The game caps a speed at 4000 km/h.");
+    return ch;
+}
+
+static bool mod_tab_clash(PortModProfile *p) {
+    bool ch = false;
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("In a clash (two beams or two rushes meeting, or two fighters trading blows) the game counts the frames "
+                       "in which a direction is newly pressed; the fighter with the higher count wins. These make that count "
+                       "easier for this fighter.");
+    ImGui::Spacing();
+    ch |= mod_percent_row("Power of each input", &p->clashPow, 100, 1000,
+                          "What each accepted input is worth: 200% counts every input twice, 150% alternately 1 and 2 points.");
+    {
+        bool any = p->clashAny != 0;
+
+        if (ImGui::Checkbox("Any button counts as an input", &any)) {
+            p->clashAny = any ? 1 : 0;
+            ch = true;
+        }
+        ImGui::SetItemTooltip("Besides a newly pressed direction, a press of Square, Triangle, Cross or Circle counts too.\n"
+                              "(The settings' \"Clashes: Square counts as a direction\" is separate and still applies.)");
+    }
+    ImGui::SetNextItemWidth(260.0f);
+    ch |= ImGui::SliderInt("Starting score (beam clashes)", &p->clashStart, 0, 50, "+%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip("Points added to this fighter's score when a beam clash begins. The game's own start is the\n"
+                          "technique's power / 20 plus its abilities, usually below 20.");
+    ImGui::TextDisabled("The loser of a clash takes the winner's damage plus half its own, or is thrown.");
+    return ch;
+}
+
+// "Host" in the controller settings: a controller (any of the connected ones), a switch and the profile it gets.
+static void host_row(void) {
+    PortModHost *h = PortMod_Host();
+    char label[200], sum[96], guid[40];
+    SDL_JoystickID *ids;
+    int count = 0;
+    bool ch = false, known = false;
+
+    ids = SDL_GetGamepads(&count);
+    for (int i = 0; i < count; i++) {
+        SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof(guid));
+        int og, on;
+
+        mod_ordinals(ids, i, &og, &on);
+        known = known || (h->guid[0] != '\0' && strcmp(guid, h->guid) == 0 && og == h->ordG);
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Host");
+    ImGui::SameLine();
+    if (h->guid[0] == '\0') {
+        snprintf(label, sizeof(label), "None");
+    } else {
+        snprintf(label, sizeof(label), "%s%s", h->name[0] != '\0' ? h->name : "(unnamed)", known ? "" : " (not connected)");
+    }
+    ImGui::SetNextItemWidth(U(300.0f));
+    if (ImGui::BeginCombo("##host", label)) {
+        if (ImGui::Selectable("None", h->guid[0] == '\0')) {
+            h->guid[0] = '\0';
+            h->name[0] = '\0';
+            h->on = 0;
+            ch = true;
+        }
+        for (int i = 0; i < count; i++) {
+            const char *n = SDL_GetGamepadNameForID(ids[i]);
+            int og, on;
+
+            SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, (int)sizeof(guid));
+            mod_ordinals(ids, i, &og, &on);
+            snprintf(label, sizeof(label), "%d: %s", i + 1, n != NULL ? n : "?");
+            if (ImGui::Selectable(label, h->guid[0] != '\0' && strcmp(guid, h->guid) == 0 && og == h->ordG)) {
+                snprintf(h->guid, sizeof(h->guid), "%s", guid);
+                snprintf(h->name, sizeof(h->name), "%s", n != NULL ? n : "");
+                h->ordG = og;
+                ch = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    SDL_free(ids);
+    ImGui::SameLine();
+    {
+        bool usable = h->guid[0] != '\0' && PortMod_Get(h->profile)->used;
+        bool on = h->on != 0 && usable;
+
+        ImGui::BeginDisabled(!usable);
+        if (ImGui::Checkbox("##hoston", &on)) {
+            h->on = on ? 1 : 0;
+            ch = true;
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    {
+        const PortModProfile *cur = PortMod_Get(h->profile);
+
+        if (cur->used) {
+            mod_summary(cur, sum, (int)sizeof(sum));
+            snprintf(label, sizeof(label), "%d: %s", h->profile + 1, sum);
+        } else {
+            snprintf(label, sizeof(label), "-");
+        }
+        ImGui::SetNextItemWidth(U(220.0f));
+        if (ImGui::BeginCombo("##hostprof", label)) {
+            for (int i = 0; i < PORTMOD_PROFILES; i++) {
+                const PortModProfile *p = PortMod_Get(i);
+
+                if (!p->used) {
+                    continue;
+                }
+                mod_summary(p, sum, (int)sizeof(sum));
+                snprintf(label, sizeof(label), "%d: %s", i + 1, sum);
+                if (ImGui::Selectable(label, h->profile == i)) {
+                    h->profile = i;
+                    ch = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    if (ch) {
+        PortMod_HostSave();
+        Port_SettingsWrite();
+    }
+}
+
+static void build_mod(void) {
+    ImGuiIO &io = ImGui::GetIO();
+    bool open = true;
+    bool changed = false;
+
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(920.0f, io.DisplaySize.y >= 800.0f ? 780.0f : 620.0f), ImGuiCond_Appearing);
+    if (pad_pressed(ImGuiKey_GamepadFaceRight)) { // Circle / B: out of the window
+        open = false;
+    }
+    if (ImGui::Begin("Mod menu (F12)", &open, ImGuiWindowFlags_NoCollapse)) {
+        if (Port_NetSession() || Port_NetActive()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Online match: nothing here is in effect.");
+        }
+        // who is the profile in effect for, right now
+        for (int side = 0; side < 2; side++) {
+            const PortModSeen *s = PortMod_Seen(side);
+            char who[96] = "no match yet";
+
+            if (s->seen) {
+                const char *nm = s->chara >= 0 ? PortCharaName(s->chara) : NULL;
+
+                snprintf(who, sizeof(who), "%s (costume %d), %s", nm != NULL ? nm : "?", s->costume, s->cpu ? "CPU" : "player");
+            }
+            ImGui::TextDisabled("Side %d: %s  ->  %s", side + 1, who, !s->seen || s->profile < 0 ? "no profile" : "profile in effect");
+            if (s->seen && s->profile >= 0) {
+                char sum[96];
+
+                mod_summary(PortMod_Get(s->profile), sum, (int)sizeof(sum));
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%d: %s)", s->profile + 1, sum);
+            }
+        }
+        ImGui::Separator();
+
+        ImGui::BeginChild("modlist", ImVec2(250.0f, -ImGui::GetFrameHeightWithSpacing() - ImGui::GetStyle().ItemSpacing.y), ImGuiChildFlags_Borders);
+        {
+            int firstFree = -1;
+
+            for (int i = 0; i < PORTMOD_PROFILES; i++) {
+                PortModProfile *p = PortMod_Get(i);
+                char line[160], sum[96];
+
+                if (!p->used) {
+                    firstFree = firstFree < 0 ? i : firstFree;
+                    snprintf(line, sizeof(line), "%d  (empty)", i + 1);
+                } else {
+                    mod_summary(p, sum, (int)sizeof(sum));
+                    snprintf(line, sizeof(line), "%d  %s%s", i + 1, sum, p->on ? "" : "  (off)");
+                }
+                if (ImGui::Selectable(line, sModSel == i)) {
+                    sModSel = i;
+                }
+            }
+            ImGui::Spacing();
+            ImGui::BeginDisabled(firstFree < 0);
+            if (ImGui::Button("+ New profile", ImVec2(-1.0f, 0.0f))) {
+                PortMod_Create(firstFree);
+                PortMod_Save(firstFree);
+                sModSel = firstFree;
+                changed = true;
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        ImGui::BeginChild("moddetail", ImVec2(0.0f, -ImGui::GetFrameHeightWithSpacing() - ImGui::GetStyle().ItemSpacing.y), ImGuiChildFlags_NavFlattened);
+        {
+            PortModProfile *p = PortMod_Get(sModSel);
+            bool ch = false;
+
+            ImGui::PushID(sModSel);
+            if (!p->used) {
+                ImGui::TextWrapped("Empty slot. \"+ New profile\" makes a profile: who it applies to (a controller, a game port, a "
+                                   "character and form), and what it changes: the defence windows, the damage, the charge rates "
+                                   "and how easily it wins a clash. The most specific profile that matches a fighter is the one in "
+                                   "effect.");
+            } else {
+                bool on = p->on != 0;
+
+                if (ImGui::Checkbox("Active", &on)) {
+                    p->on = on ? 1 : 0;
+                    ch = true;
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(300.0f);
+                if (ImGui::InputTextWithHint("##label", "Name (optional)", p->label, sizeof(p->label))) {
+                    ch = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Delete")) {
+                    PortMod_Clear(sModSel);
+                    PortMod_Save(sModSel);
+                    changed = true;
+                    ch = false;
+                } else if (ImGui::BeginTabBar("modtabs")) {
+                    if (ImGui::BeginTabItem("Applies to")) {
+                        ch |= mod_tab_applies(sModSel, p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Defense / Timing")) {
+                        ch |= mod_tab_timing(p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Ki / Skills")) {
+                        ch |= mod_tab_ki(p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Damage")) {
+                        ch |= mod_tab_damage(p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Ki blasts")) {
+                        ch |= mod_tab_blasts(p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Movement")) {
+                        ch |= mod_tab_movement(p);
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Clash")) {
+                        ch |= mod_tab_clash(p);
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                    ImGui::Separator();
+                    if (ImGui::Button("Reset values")) {
+                        PortMod_Reset(sModSel);
+                        ch = true;
+                    }
+                    ImGui::SetItemTooltip("Everything it changes back to the game's own. Who it applies to stays.");
+                }
+            }
+            ImGui::PopID();
+            if (ch) {
+                PortMod_Save(sModSel);
+                changed = true;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::TextDisabled("F12 or Esc: close.  Saved as you change it.  Single player and local matches only.");
+    }
+    ImGui::End();
+    if (changed) {
+        Port_SettingsWrite();
+    }
+    if (!open) {
+        set_open(false);
     }
 }
 
@@ -2575,6 +3258,8 @@ static bool frame_build(void) {
     if (sOpen) {
         if (sNet) {
             build_net();
+        } else if (sModMenu) {
+            build_mod();
         } else {
             build();
         }

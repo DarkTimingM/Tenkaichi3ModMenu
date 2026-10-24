@@ -910,3 +910,12 @@ bool FightPanels_Draw(ImDrawList *dl, float lx, float rx, float y0, float y1, fl
     sAlpha = 1.0f;
     return true;
 }
+
+// For the mod menu (ui.cpp): the character names by id.
+extern "C" const char *PortCharaName(int chara) {
+    return chara_name(chara);
+}
+
+extern "C" int PortCharaCount(void) {
+    return (int)(sizeof(kCharaNames) / sizeof(kCharaNames[0]));
+}
