@@ -53,6 +53,8 @@ typedef struct {
    a character, only that one), whether or not the profile is switched on in the mod menu. */
 typedef struct {
     int on;
+    int managed; /* the row has been used: the profile it names is then in effect only through the row (the tick and the
+                    controller), not through its own conditions */
     int profile; /* 0 .. PORTMOD_PROFILES - 1 */
     int ordG;    /* which of the identical controllers it is (see PortModProfile) */
     char guid[40];

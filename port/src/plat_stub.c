@@ -250,6 +250,7 @@ static void mod_load(void) {
         mod_name(n, sizeof(n), i, "label"); Port_SettingText(n, "", p->label, (int)sizeof(p->label));
     }
     sHost.on = Port_Setting("host_on", 0) != 0;
+    sHost.managed = Port_Setting("host_mgd", 0) != 0;
     sHost.profile = clampi(Port_Setting("host_prof", 0), 0, PORTMOD_PROFILES - 1);
     sHost.ordG = clampi(Port_Setting("host_ordg", 0), 0, 7);
     Port_SettingText("host_guid", "", sHost.guid, (int)sizeof(sHost.guid));
@@ -286,6 +287,7 @@ PortModHost *PortMod_Host(void) {
 void PortMod_HostSave(void) {
     mod_load();
     Port_SettingSave("host_on", sHost.on);
+    Port_SettingSave("host_mgd", sHost.managed);
     Port_SettingSave("host_prof", sHost.profile);
     Port_SettingSave("host_ordg", sHost.ordG);
     Port_SettingTextSave("host_guid", sHost.guid);
@@ -344,6 +346,9 @@ int PortMod_Resolve(int side, int pad, int cpu, int chara, int costume) {
 
         if (!p->used || !p->on) {
             continue;
+        }
+        if (sHost.managed && i == sHost.profile) {
+            continue; /* the Host row owns this profile: it is in effect only when the row says so (above) */
         }
         if ((p->who == PORTMOD_WHO_PLAYER && cpu) || (p->who == PORTMOD_WHO_CPU && !cpu)) {
             continue;

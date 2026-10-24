@@ -2388,7 +2388,7 @@ static bool mod_tab_clash(PortModProfile *p) {
 // "Host" in the controller settings: a controller (any of the connected ones), a switch and the profile it gets.
 static void host_row(void) {
     PortModHost *h = PortMod_Host();
-    char label[200], sum[96], guid[40];
+    char label[200], guid[40];
     SDL_JoystickID *ids;
     int count = 0;
     bool ch = false, known = false;
@@ -2451,8 +2451,7 @@ static void host_row(void) {
         const PortModProfile *cur = PortMod_Get(h->profile);
 
         if (cur->used) {
-            mod_summary(cur, sum, (int)sizeof(sum));
-            snprintf(label, sizeof(label), "%d: %s", h->profile + 1, sum);
+            snprintf(label, sizeof(label), "Perfil del Mando %d", h->profile + 1);
         } else {
             snprintf(label, sizeof(label), "-");
         }
@@ -2464,8 +2463,7 @@ static void host_row(void) {
                 if (!p->used) {
                     continue;
                 }
-                mod_summary(p, sum, (int)sizeof(sum));
-                snprintf(label, sizeof(label), "%d: %s", i + 1, sum);
+                snprintf(label, sizeof(label), "Perfil del Mando %d", i + 1);
                 if (ImGui::Selectable(label, h->profile == i)) {
                     h->profile = i;
                     ch = true;
@@ -2475,6 +2473,7 @@ static void host_row(void) {
         }
     }
     if (ch) {
+        h->managed = 1; // (from now on the row decides whether its profile is in effect)
         PortMod_HostSave();
         Port_SettingsWrite();
     }
